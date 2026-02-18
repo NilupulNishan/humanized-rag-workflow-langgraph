@@ -10,7 +10,7 @@ A production-grade system for processing multiple PDF documents and creating sea
 - 💾 Persistent storage with ChromaDB
 - ⚙️ Easy configuration via environment variables
 
-Archive powershell 👇:
+# Archive powershell 👇:
 ```
 git archive --format=zip HEAD -o Chunking_with_LlamaIndex.zip
 ```
