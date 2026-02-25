@@ -1,185 +1,181 @@
 """
-Main script to process PDFs and create embeddings with persistent docstore.
+Production-grade PDF processing pipeline.
 """
 import sys
-import json
+import logging
 from pathlib import Path
+from tqdm import tqdm
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-import chromadb
-from llama_index.core import VectorStoreIndex, StorageContext
-from llama_index.core.storage.docstore import SimpleDocumentStore
-from llama_index.vector_stores.chroma import ChromaVectorStore
-from tqdm import tqdm
-
 from config import settings
-from src.pdf_processor import PDFProcessor
+from src.pdf_loader import PDFLoader
 from src.embeddings import EmbeddingsManager
 from src.chunker import DocumentChunker
+from src.storage_manager import StorageManager
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def get_docstore_path(collection_name):
-    """Get path for docstore JSON file."""
-    docstore_dir = settings.CHROMA_DB_PATH / "docstores"
-    docstore_dir.mkdir(exist_ok=True)
-    return docstore_dir / f"{collection_name}_docstore.json"
-
-
-def save_docstore(docstore, collection_name):
-    """Save docstore to disk."""
-    docstore_path = get_docstore_path(collection_name)
-    
-    # Convert docstore to JSON
-    docs_dict = {}
-    for doc_id, doc in docstore.docs.items():
-        docs_dict[doc_id] = doc.to_dict()
-    
-    with open(docstore_path, 'w') as f:
-        json.dump(docs_dict, f)
-    
-    print(f"  Saved docstore to: {docstore_path.name}")
-
-
-def process_single_pdf(document, collection_name, pdf_path, embeddings_manager, chunker):
+def process_single_pdf(
+    page_documents, 
+    collection_name, 
+    pdf_path, 
+    chunker, 
+    storage_manager,
+    embed_model
+):
     """
-    Process a single PDF document.
+    Process a single PDF through the complete pipeline.
     
     Args:
-        document: The loaded document
-        collection_name: Name for the ChromaDB collection
-        pdf_path: Path to the PDF file
-        embeddings_manager: Embeddings manager instance
-        chunker: Document chunker instance
+        page_documents: List of per-page documents
+        collection_name: Name for the collection
+        pdf_path: Path to PDF file
+        chunker: DocumentChunker instance
+        storage_manager: StorageManager instance
+        embed_model: Embedding model
     """
-    print(f"\n{'='*80}")
-    print(f"Processing: {pdf_path.name}")
-    print(f"Collection: {collection_name}")
-    print(f"{'='*80}")
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Processing: {pdf_path.name}")
+    logger.info(f"Collection: {collection_name}")
+    logger.info(f"{'='*80}")
     
-    # Process document
-    all_nodes, enriched_leaf_nodes = chunker.process_document(document)
-    
-    # Setup ChromaDB
-    print(f"\nSetting up ChromaDB...")
-    chroma_client = chromadb.PersistentClient(path=str(settings.CHROMA_DB_PATH))
-    
-    # Delete collection if it exists
     try:
-        chroma_client.delete_collection(collection_name)
-        print(f"  Deleted existing collection: {collection_name}")
-    except:
-        pass
-    
-    chroma_collection = chroma_client.create_collection(collection_name)
-    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-    
-    # Create document store with ALL nodes (for AutoMergingRetriever)
-    docstore = SimpleDocumentStore()
-    docstore.add_documents(all_nodes)
-    
-    # Save docstore to disk
-    save_docstore(docstore, collection_name)
-    
-    # Create storage context
-    storage_context = StorageContext.from_defaults(
-        vector_store=vector_store,
-        docstore=docstore
-    )
-    
-    # Create index with progress bar
-    print(f"\nCreating embeddings...")
-    with tqdm(total=len(enriched_leaf_nodes), desc="Embedding nodes") as pbar:
-        # Create index
-        index = VectorStoreIndex(
-            enriched_leaf_nodes,
-            storage_context=storage_context,
-            show_progress=False  # We're using our own progress bar
+        # Process documents (metadata automatically flows!)
+        all_nodes, enriched_nodes = chunker.process_documents(page_documents)
+        
+        # Save to storage
+        success = storage_manager.save_collection(
+            collection_name,
+            all_nodes,
+            enriched_nodes,
+            embed_model
         )
-        pbar.update(len(enriched_leaf_nodes))
-    
-    print(f"\n✓ Successfully processed {pdf_path.name}")
-    print(f"  Collection: {collection_name}")
-    print(f"  Total nodes: {len(all_nodes)}")
-    print(f"  Indexed nodes: {len(enriched_leaf_nodes)}")
+        
+        if success:
+            logger.info(f"✓ Successfully processed {pdf_path.name}")
+            return True
+        else:
+            logger.error(f"✗ Failed to save {pdf_path.name}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"✗ Error processing {pdf_path.name}: {e}", exc_info=True)
+        return False
 
 
 def main():
     """Main processing function."""
     print("\n" + "="*80)
-    print("PDF EMBEDDINGS PROCESSING (With Persistent Docstore)")
+    print("PDF EMBEDDINGS PROCESSING - PRODUCTION")
     print("="*80)
     
     # Validate configuration
     try:
         settings.validate_config()
     except ValueError as e:
+        logger.error(f"Configuration Error: {e}")
         print(f"\n❌ Configuration Error: {e}")
         print("\nPlease set up your .env file with Azure OpenAI credentials.")
         return 1
     
     # Initialize components
+    logger.info("\nInitializing components...")
     print("\nInitializing components...")
-    pdf_processor = PDFProcessor()
-    embeddings_manager = EmbeddingsManager()
-    chunker = DocumentChunker(embeddings_manager.get_llm())
+    
+    try:
+        pdf_loader = PDFLoader()
+        embeddings_manager = EmbeddingsManager()
+        chunker = DocumentChunker(embeddings_manager.get_llm())
+        storage_manager = StorageManager()
+        
+        print("✓ All components initialized")
+        
+    except Exception as e:
+        logger.error(f"Initialization failed: {e}", exc_info=True)
+        print(f"\n❌ Initialization Error: {e}")
+        return 1
     
     # Load PDFs
+    logger.info("\nLoading PDFs...")
+    print("\nLoading PDFs...")
+    
     try:
-        pdf_data = pdf_processor.load_all_pdfs(settings.PDF_DIRECTORY)
+        pdf_data = pdf_loader.load_all_pdfs(settings.PDF_DIRECTORY)
     except ValueError as e:
+        logger.error(f"PDF loading failed: {e}")
         print(f"\n❌ Error: {e}")
         print(f"\nPlease add PDF files to: {settings.PDF_DIRECTORY}")
         return 1
     
     if not pdf_data:
+        logger.error("No PDFs were successfully loaded")
         print("\n❌ No PDFs were successfully loaded")
         return 1
     
     # Process each PDF
+    logger.info(f"\nProcessing {len(pdf_data)} PDF(s)")
     print(f"\n{'='*80}")
     print(f"PROCESSING {len(pdf_data)} PDF(S)")
-    print(f"{'='*80}")
+    print(f"{'='*80}\n")
     
     successful = 0
     failed = 0
     
-    for i, (document, collection_name, pdf_path) in enumerate(pdf_data, 1):
+    for i, (page_documents, collection_name, pdf_path) in enumerate(pdf_data, 1):
+        print(f"[{i}/{len(pdf_data)}] Processing {pdf_path.name}...")
+        
         try:
-            print(f"\n[{i}/{len(pdf_data)}] Processing {pdf_path.name}...")
-            process_single_pdf(
-                document,
+            success = process_single_pdf(
+                page_documents,
                 collection_name,
                 pdf_path,
-                embeddings_manager,
-                chunker
+                chunker,
+                storage_manager,
+                embeddings_manager.get_embed_model()
             )
-            successful += 1
+            
+            if success:
+                successful += 1
+                print(f"✓ {pdf_path.name} completed\n")
+            else:
+                failed += 1
+                print(f"✗ {pdf_path.name} failed\n")
+                
         except Exception as e:
-            print(f"\n❌ Error processing {pdf_path.name}: {e}")
+            logger.error(f"Unexpected error processing {pdf_path.name}: {e}", exc_info=True)
+            print(f"✗ {pdf_path.name} failed: {e}\n")
             failed += 1
             continue
     
     # Summary
-    print(f"\n{'='*80}")
+    print(f"{'='*80}")
     print("PROCESSING COMPLETE")
     print(f"{'='*80}")
     print(f"✓ Successful: {successful}")
     if failed > 0:
-        print(f"❌ Failed: {failed}")
+        print(f"✗ Failed: {failed}")
     
     # Show available collections
     print(f"\nAvailable collections:")
-    chroma_client = chromadb.PersistentClient(path=str(settings.CHROMA_DB_PATH))
-    collections = chroma_client.list_collections()
-    for col in collections:
-        docstore_path = get_docstore_path(col.name)
-        docstore_exists = "✓" if docstore_path.exists() else "✗"
-        print(f"  {docstore_exists} {col.name}")
+    collections = storage_manager.list_collections()
     
-    print(f"\nYou can now query these collections using scripts/query.py")
+    for coll in collections:
+        info = storage_manager.get_collection_info(coll)
+        docstore_status = "✓" if info.get('has_docstore') else "✗"
+        print(f"  {docstore_status} {coll} ({info.get('count', 0)} chunks)")
+    
+    print(f"\n💡 Query these collections using: python scripts/query.py")
+    
+    logger.info("Processing pipeline completed")
     
     return 0 if failed == 0 else 1
 

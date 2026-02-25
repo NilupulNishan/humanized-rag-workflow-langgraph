@@ -1,7 +1,8 @@
 """
-Interactive query script for searching PDF collections.
+Production-grade interactive query interface.
 """
 import sys
+import logging
 from pathlib import Path
 
 # Add project root to path
@@ -9,15 +10,19 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from colorama import init, Fore, Style
-try:
-    # Try to import v2 first (with docstore support)
-    from src.query_engine import QueryEngine, MultiCollectionQueryEngine
-except ImportError:
-    # Fall back to v1 (simpler version)
-    from src.query_engine import QueryEngine, MultiCollectionQueryEngine
+from src.retriever import SmartRetriever, MultiCollectionRetriever
+from src.storage_manager import StorageManager
+from src.source_formatter import SourceFormatter
 
-# Initialize colorama for colored output
+# Initialize colorama
 init()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.WARNING,  # Only show warnings in interactive mode
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 def print_header(text):
@@ -43,7 +48,8 @@ def select_collection(collections):
         Selected collection name or None for all
     """
     print("Available collections:")
-    print(f"  0. Search ALL collections")
+    print(f"  0. {Fore.YELLOW}Search ALL collections{Style.RESET_ALL}")
+    
     for i, name in enumerate(collections, 1):
         print(f"  {i}. {name}")
     
@@ -71,12 +77,14 @@ def select_collection(collections):
 
 def interactive_query():
     """Run interactive query session."""
-    print_header("PDF QUERY SYSTEM")
+    print_header("PDF QUERY SYSTEM - PRODUCTION")
     
     # Get available collections
     try:
-        collections = QueryEngine.get_available_collections()
+        storage_manager = StorageManager()
+        collections = storage_manager.list_collections()
     except Exception as e:
+        logger.error(f"Failed to access storage: {e}", exc_info=True)
         print(f"{Fore.RED}Error accessing database: {e}{Style.RESET_ALL}")
         print(f"\nPlease run 'python scripts/process_pdfs.py' first.")
         return 1
@@ -89,17 +97,21 @@ def interactive_query():
     # Select collection
     selected = select_collection(collections)
     
-    # Initialize query engine
+    # Initialize retriever
     try:
         if selected:
-            engine = QueryEngine(selected, verbose=False)
+            retriever = SmartRetriever(selected, verbose=False)
             print(f"\n{Fore.GREEN}✓ Connected to collection: {selected}{Style.RESET_ALL}")
         else:
-            engine = MultiCollectionQueryEngine(verbose=False)
+            retriever = MultiCollectionRetriever(verbose=False)
             print(f"\n{Fore.GREEN}✓ Connected to all collections{Style.RESET_ALL}")
     except Exception as e:
+        logger.error(f"Failed to initialize retriever: {e}", exc_info=True)
         print(f"{Fore.RED}Error initializing query engine: {e}{Style.RESET_ALL}")
         return 1
+    
+    # Initialize formatter
+    formatter = SourceFormatter()
     
     # Query loop
     print(f"\n{Fore.YELLOW}Enter your questions (or 'quit' to exit){Style.RESET_ALL}")
@@ -121,31 +133,47 @@ def interactive_query():
             if query.lower() == 'change':
                 # Change collection
                 selected = select_collection(collections)
-                if selected:
-                    engine = QueryEngine(selected, verbose=False)
-                    print(f"\n{Fore.GREEN}✓ Switched to collection: {selected}{Style.RESET_ALL}")
-                else:
-                    engine = MultiCollectionQueryEngine(verbose=False)
-                    print(f"\n{Fore.GREEN}✓ Switched to all collections{Style.RESET_ALL}")
+                
+                try:
+                    if selected:
+                        retriever = SmartRetriever(selected, verbose=False)
+                        print(f"\n{Fore.GREEN}✓ Switched to collection: {selected}{Style.RESET_ALL}")
+                    else:
+                        retriever = MultiCollectionRetriever(verbose=False)
+                        print(f"\n{Fore.GREEN}✓ Switched to all collections{Style.RESET_ALL}")
+                except Exception as e:
+                    print(f"{Fore.RED}Error switching collection: {e}{Style.RESET_ALL}")
+                
                 continue
             
             # Execute query
             print(f"\n{Fore.YELLOW}Searching...{Style.RESET_ALL}")
             
-            if isinstance(engine, MultiCollectionQueryEngine):
+            if isinstance(retriever, MultiCollectionRetriever):
                 # Multi-collection search
-                collection_name, response = engine.query_best(query)
-                print(f"\n{Fore.YELLOW}Best match from: {collection_name}{Style.RESET_ALL}")
-                print_response(response)
+                response = retriever.query_best(query)
+                
+                if response.retrieval_successful:
+                    print(f"\n{Fore.YELLOW}Best match from: {response.collection_name}{Style.RESET_ALL}")
+                    print_response(response.answer)
+                    print(formatter.format_for_terminal(response.source_nodes))
+                else:
+                    print(f"\n{Fore.RED}Error: {response.error_message}{Style.RESET_ALL}\n")
             else:
                 # Single collection search
-                response = engine.query(query)
-                print_response(response)
+                response = retriever.query(query)
+                
+                if response.retrieval_successful:
+                    print_response(response.answer)
+                    print(formatter.format_for_terminal(response.source_nodes))
+                else:
+                    print(f"\n{Fore.RED}Error: {response.error_message}{Style.RESET_ALL}\n")
         
         except KeyboardInterrupt:
             print(f"\n\n{Fore.YELLOW}Goodbye!{Style.RESET_ALL}")
             break
         except Exception as e:
+            logger.error(f"Query error: {e}", exc_info=True)
             print(f"\n{Fore.RED}Error: {e}{Style.RESET_ALL}\n")
             continue
     
@@ -161,18 +189,25 @@ def single_query(collection_name, query_text):
         query_text: Query string
     """
     try:
-        if collection_name:
-            engine = QueryEngine(collection_name)
-            response = engine.query(query_text)
-            print(response)
-        else:
-            engine = MultiCollectionQueryEngine()
-            collection_name, response = engine.query_best(query_text)
-            print(f"Best match from: {collection_name}")
-            print(response)
+        formatter = SourceFormatter()
         
-        return 0
+        if collection_name:
+            retriever = SmartRetriever(collection_name)
+            response = retriever.query(query_text)
+        else:
+            retriever = MultiCollectionRetriever()
+            response = retriever.query_best(query_text)
+        
+        if response.retrieval_successful:
+            print(response.answer)
+            print(formatter.format_for_plain_text(response.source_nodes))
+            return 0
+        else:
+            print(f"Error: {response.error_message}", file=sys.stderr)
+            return 1
+        
     except Exception as e:
+        logger.error(f"Query failed: {e}", exc_info=True)
         print(f"Error: {e}", file=sys.stderr)
         return 1
 

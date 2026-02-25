@@ -1,15 +1,22 @@
 """
 PDF Embeddings System - Source Package
 """
-from .pdf_processor import PDFProcessor
+from .pdf_loader import PDFLoader
 from .embeddings import EmbeddingsManager
 from .chunker import DocumentChunker
-from .query_engine import QueryEngine, MultiCollectionQueryEngine
+from .metadata_manager import MetadataManager
+from .storage_manager import StorageManager
+from .storage_manager import StorageManager
+from .retriever import SmartRetriever, MultiCollectionRetriever, QueryResponse
 
 __all__ = [
-    'PDFProcessor',
+    'PDFLoader',
     'EmbeddingsManager',
     'DocumentChunker',
-    'QueryEngine',
+    'MetadataManager',
+    'StorageManager',
     'MultiCollectionQueryEngine',
+    'SmartRetriever',
+    'MultiCollectionRetriever',
+    'QueryResponse',
 ]

@@ -27,14 +27,14 @@ def test_chunk_sizes():
 
 def test_pdf_processor_import():
     """Test that PDFProcessor can be imported."""
-    from src.pdf_processor import PDFProcessor
+    from src.pdf_loader import PDFProcessor
     processor = PDFProcessor()
     assert processor is not None
 
 
 def test_collection_name_generation():
     """Test collection name generation from filenames."""
-    from src.pdf_processor import PDFProcessor
+    from src.pdf_loader import PDFProcessor
     
     processor = PDFProcessor()
     
