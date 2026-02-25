@@ -1,352 +1,626 @@
 """
-Query interface — clean terminal UI with integrated PDF viewer.
+Streamlit RAG interface — chat UI + embedded PDF viewer (no cross-origin issues).
 
-Usage:
-    python query.py                          # interactive mode
-    python query.py "your question"          # single query, all collections
-    python query.py collection "question"    # single query, specific collection
+The PDF is read from disk, base64-encoded, and injected as a data URI directly
+into a components.v1.html() block — same origin as Streamlit, Chrome never
+blocks it.
+
+Run:
+    streamlit run app.py
 """
 
 import sys
+import base64
 import logging
-import textwrap
 from pathlib import Path
 
-# ─── Path setup ──────────────────────────────────────────────────────────────
-project_root = Path(__file__).parent
-sys.path.insert(0, str(project_root))
+# ─── Path setup ───────────────────────────────────────────────────────────────
+PROJECT_ROOT = Path(__file__).parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from colorama import init, Fore, Style
-from src.retriever import SmartRetriever, MultiCollectionRetriever
-from src.storage_manager import StorageManager
-from src.source_formatter import SourceFormatter
-from src.metadata_manager import MetadataManager
-from pdf_server import start_server_background, get_viewer_url, open_pdf_at_page, SERVER_PORT
+import streamlit as st
 
-# ─── Init ─────────────────────────────────────────────────────────────────────
-init()  # colorama
-
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+st.set_page_config(
+    page_title="PDF·RAG",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
+
+from src.storage_manager import StorageManager
+from src.retriever import SmartRetriever, MultiCollectionRetriever
+from src.metadata_manager import MetadataManager
+from pdf_server import get_viewer_url, SERVER_PORT, start_server_background
+
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# ─── Theme ────────────────────────────────────────────────────────────────────
-DIM   = Style.DIM
-RST   = Style.RESET_ALL
-BOLD  = Style.BRIGHT
-
-C_FRAME   = Fore.BLUE   + DIM
-C_LABEL   = Fore.CYAN   + BOLD
-C_ANSWER  = Fore.WHITE
-C_SOURCE  = Fore.GREEN  + BOLD
-C_LINK    = Fore.CYAN
-C_PAGE    = Fore.YELLOW + BOLD
-C_MUTED   = Fore.WHITE  + DIM
-C_ERR     = Fore.RED
-C_PROMPT  = Fore.BLUE   + BOLD
-C_CMD     = Fore.MAGENTA + DIM
-C_SUCCESS = Fore.GREEN  + BOLD
-
-TERM_WIDTH = 80
-
-
-# ─── Formatting helpers ───────────────────────────────────────────────────────
-
-def rule(char="─", width=TERM_WIDTH, color=C_FRAME):
-    return f"{color}{char * width}{RST}"
-
-
-def header(title: str):
-    print()
-    print(rule("═"))
-    pad = (TERM_WIDTH - len(title)) // 2
-    print(f"{C_FRAME}║{RST}{' ' * pad}{C_LABEL}{title}{RST}{' ' * (TERM_WIDTH - pad - len(title) - 2)}{C_FRAME}║{RST}")
-    print(rule("═"))
-    print()
-
-
-def section(label: str):
-    """Print a subtle section divider."""
-    label_str = f"  {label}  "
-    bar_len = (TERM_WIDTH - len(label_str)) // 2
-    print(f"\n{C_FRAME}{'─' * bar_len}{RST}{C_MUTED}{label_str}{RST}{C_FRAME}{'─' * bar_len}{RST}\n")
-
-
-def print_answer(text: str):
-    """Print the LLM answer with clean wrapping."""
-    wrapper = textwrap.TextWrapper(width=TERM_WIDTH - 4, initial_indent="  ", subsequent_indent="  ")
-    paragraphs = text.strip().split("\n")
-    for para in paragraphs:
-        if para.strip():
-            print(f"{C_ANSWER}{wrapper.fill(para)}{RST}")
-        else:
-            print()
-
-
-def print_sources(nodes: list, open_browser: bool = True):
-    """
-    Print source citations + clickable localhost links.
-    Optionally opens the first source in the browser.
-    """
-    mm = MetadataManager()
-    pages   = mm.extract_pages_from_nodes(nodes)
-    ranges  = mm.merge_consecutive_pages(pages)
-    fname   = mm.extract_filename_from_nodes(nodes)
-
-    if not pages:
-        print(f"\n  {C_MUTED}No source pages found.{RST}")
-        return
-
-    section("SOURCES")
-    print(f"  {C_SOURCE}📄 {fname}{RST}\n")
-
-    first_url = None
-    first_page = None
-
-    for i, (start, end) in enumerate(ranges):
-        page_text = mm.format_page_range(start, end)
-        viewer_url = get_viewer_url(fname, start)
-
-        marker = "▸" if i == 0 else " "
-        print(f"  {C_FRAME}{marker}{RST} {C_PAGE}{page_text:<14}{RST}  {C_LINK}{viewer_url}{RST}")
-
-        if i == 0:
-            first_url = viewer_url
-            first_page = start
-
-    print()
-
-    if open_browser and first_url and first_page is not None:
-        print(f"  {C_MUTED}Opening {fname} at {mm.format_page_range(first_page, first_page)} …{RST}")
-        open_pdf_at_page(fname, first_page)
-
-    print(f"\n  {C_MUTED}Tip: paste any URL above into your browser · [ / ] keys to flip pages{RST}")
-
-
-def print_collection_list(collections: list):
-    """Display available collections as a numbered list."""
-    print(f"\n  {C_LABEL}AVAILABLE COLLECTIONS{RST}\n")
-    print(f"  {C_CMD}  0  {RST}  {C_MUTED}Search ALL collections{RST}")
-    for i, name in enumerate(collections, 1):
-        print(f"  {C_CMD}{i:>3}{RST}  {name}")
-    print()
-
-
-def print_commands():
-    """Print the command reference bar."""
-    cmds = [
-        ("quit / q", "exit"),
-        ("change",   "switch collection"),
-        ("open N",   "open source page N in browser"),
-    ]
-    line = "  " + "   ·   ".join(f"{C_CMD}{k}{RST} {C_MUTED}{v}{RST}" for k, v in cmds)
-    print(line)
-    print()
-
-
-# ─── Collection selector ──────────────────────────────────────────────────────
-
-def select_collection(collections: list) -> str | None:
-    """Interactive collection picker. Returns name or None (= all)."""
-    print_collection_list(collections)
-
-    while True:
-        try:
-            raw = input(f"  {C_PROMPT}Select [{C_RST}0{C_PROMPT}–{len(collections)}]{RST}  ").strip()
-            if not raw:
-                continue
-            n = int(raw)
-            if n == 0:
-                return None
-            if 1 <= n <= len(collections):
-                return collections[n - 1]
-            print(f"  {C_ERR}Out of range.{RST}")
-        except ValueError:
-            print(f"  {C_ERR}Enter a number.{RST}")
-        except KeyboardInterrupt:
-            print()
-            sys.exit(0)
-
-# tiny hack so f-string above works
-C_RST = RST
-
-
-# ─── Retriever factory ────────────────────────────────────────────────────────
-
-def build_retriever(selected: str | None, verbose=False):
-    """Build either SmartRetriever or MultiCollectionRetriever."""
-    if selected:
-        return SmartRetriever(selected, verbose=verbose)
-    return MultiCollectionRetriever(verbose=verbose)
-
-
-# ─── Interactive mode ─────────────────────────────────────────────────────────
-
-def interactive_query():
-    header("PDF  QUERY  SYSTEM")
-
-    # ── Check collections ────────────────────────────────────────────────────
-    try:
-        storage = StorageManager()
-        collections = storage.list_collections()
-    except Exception as e:
-        print(f"\n  {C_ERR}Storage error: {e}{RST}")
-        print(f"  {C_MUTED}Run process_pdfs.py first.{RST}\n")
-        return 1
-
-    if not collections:
-        print(f"\n  {C_ERR}No collections found.{RST}")
-        print(f"  {C_MUTED}Run process_pdfs.py first.{RST}\n")
-        return 1
-
-    # ── Start PDF server ─────────────────────────────────────────────────────
-    started = start_server_background()
-    if started:
-        print(f"  {C_SUCCESS}✓{RST} {C_MUTED}PDF server  →  http://127.0.0.1:{SERVER_PORT}{RST}\n")
-
-    # ── Pick collection ───────────────────────────────────────────────────────
-    selected = select_collection(collections)
-    label = selected if selected else "ALL collections"
-
-    try:
-        retriever = build_retriever(selected)
-        print(f"\n  {C_SUCCESS}✓{RST} Connected to {C_LABEL}{label}{RST}\n")
-    except Exception as e:
-        print(f"\n  {C_ERR}Failed to load retriever: {e}{RST}\n")
-        return 1
-
-    # Keep last response's nodes so user can `open N`
-    last_nodes: list = []
-
-    print(rule())
-    print_commands()
-
-    # ── Query loop ────────────────────────────────────────────────────────────
-    while True:
-        try:
-            raw = input(f"{C_PROMPT}▸ Query:{RST} ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print(f"\n\n  {C_MUTED}Goodbye.{RST}\n")
-            break
-
-        if not raw:
-            continue
-
-        # Commands ────────────────────────────────────────────────────────────
-        cmd = raw.lower()
-
-        if cmd in ("quit", "exit", "q"):
-            print(f"\n  {C_MUTED}Goodbye.{RST}\n")
-            break
-
-        if cmd == "change":
-            selected = select_collection(collections)
-            label = selected if selected else "ALL collections"
-            try:
-                retriever = build_retriever(selected)
-                print(f"\n  {C_SUCCESS}✓{RST} Switched to {C_LABEL}{label}{RST}\n")
-            except Exception as e:
-                print(f"\n  {C_ERR}Error: {e}{RST}\n")
-            continue
-
-        # `open N` — open a specific source page
-        if cmd.startswith("open"):
-            parts = cmd.split()
-            if len(parts) == 2 and parts[1].isdigit() and last_nodes:
-                mm = MetadataManager()
-                fname = mm.extract_filename_from_nodes(last_nodes)
-                page  = int(parts[1])
-                open_pdf_at_page(fname, page)
-                print(f"  {C_MUTED}Opened page {page} of {fname}{RST}\n")
-            else:
-                print(f"  {C_MUTED}Usage: open <page_number>   (e.g. open 42){RST}\n")
-            continue
-
-        # Query ───────────────────────────────────────────────────────────────
-        print(f"\n  {C_MUTED}Searching …{RST}")
-
-        try:
-            if isinstance(retriever, MultiCollectionRetriever):
-                response = retriever.query_best(raw)
-                if response.retrieval_successful:
-                    print(f"\n  {C_MUTED}Best match: {C_LABEL}{response.collection_name}{RST}\n")
-            else:
-                response = retriever.query(raw)
-
-            if response.retrieval_successful:
-                section("ANSWER")
-                print_answer(response.answer)
-                last_nodes = response.source_nodes
-                print_sources(last_nodes, open_browser=True)
-            else:
-                print(f"\n  {C_ERR}Error: {response.error_message}{RST}\n")
-
-        except Exception as e:
-            print(f"\n  {C_ERR}Query failed: {e}{RST}\n")
-            logger.exception("Query error")
-
-        print(rule())
-
-    return 0
-
-
-# ─── Single-shot (non-interactive) ────────────────────────────────────────────
-
-def single_query(collection_name: str | None, query_text: str) -> int:
-    """One-shot query for scripting / piping."""
+# Start pdf_server so citation pills (open-in-new-tab) still work
+@st.cache_resource
+def _boot_pdf_server():
     start_server_background()
 
+_boot_pdf_server()
+
+PDF_DIR = PROJECT_ROOT / "data" / "pdfs"
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def pdf_to_b64(filename: str) -> str | None:
+    """Read PDF from disk and return base64 string, or None if missing."""
+    path = PDF_DIR / filename
+    if not path.exists():
+        return None
+    return base64.b64encode(path.read_bytes()).decode("utf-8")
+
+
+def render_pdf_viewer(filename: str, page: int, height: int = 700) -> None:
+    """
+    Render a PDF viewer entirely inside Streamlit using a base64 data URI.
+    No external server request — Chrome cannot block it.
+    """
+    b64 = pdf_to_b64(filename)
+    if b64 is None:
+        st.warning(f"PDF not found: `{filename}`")
+        return
+
+    viewer_html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap');
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: #00072c;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'JetBrains Mono', monospace;
+  }}
+  .bar {{
+    display: flex; align-items: center; gap: 12px;
+    padding: 7px 14px;
+    background: #001c54; border-bottom: 1px solid #0e6ba8;
+    flex-shrink: 0; min-height: 40px;
+  }}
+  .logo  {{ font-size:10px; font-weight:600; letter-spacing:.12em; color:#a5e1f9; text-transform:uppercase; }}
+  .fname {{ font-size:11px; color:#a5e1f9; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .pbadge {{
+    font-size:10px; color:#0e6ba8;
+    background:#a5e1f9; border:1px solid #0e6ba8;
+    padding:2px 8px; border-radius:4px; white-space:nowrap;
+  }}
+  .nav {{ display:flex; align-items:center; gap:6px; }}
+  .nav input {{
+    width:48px; background:#00072c; border:1px solid #0e6ba8;
+    border-radius:4px; color:#a5e1f9; font-family:inherit;
+    font-size:11px; padding:2px 6px; text-align:center; outline:none;
+  }}
+  .nav input:focus {{ border-color:#a5e1f9; }}
+  .nav button {{
+    background:#0a2471; color:#a5e1f9; border:1px solid #0e6ba8;
+    border-radius:4px; font-family:inherit; font-size:10px; font-weight:600;
+    padding:2px 8px; cursor:pointer; transition:all .12s;
+  }}
+  .nav button:hover {{ background:#0e6ba8; color:#a5e1f9; }}
+  iframe {{ flex:1; width:100%; border:none; display:block; }}
+</style>
+</head>
+<body>
+<div class="bar">
+  <span class="logo">PDF·RAG</span>
+  <span class="fname" title="{filename}">{filename}</span>
+  <span class="pbadge" id="pbadge">Page {page}</span>
+  <div class="nav">
+    <input id="pg" type="number" min="1" value="{page}">
+    <button onclick="jump()">Go</button>
+  </div>
+</div>
+<iframe id="pdf"
+  src="data:application/pdf;base64,{b64}#page={page}"
+  title="{filename}">
+</iframe>
+<script>
+  document.getElementById('pg').addEventListener('input', function() {{
+    document.getElementById('pbadge').textContent = 'Page ' + (this.value || '?');
+  }});
+  function jump() {{
+    var p = parseInt(document.getElementById('pg').value, 10);
+    if (!p || p < 1) return;
+    document.getElementById('pbadge').textContent = 'Page ' + p;
+    document.getElementById('pdf').src =
+      'data:application/pdf;base64,{b64}#page=' + p;
+  }}
+  document.getElementById('pg').addEventListener('keydown', function(e) {{
+    if (e.key === 'Enter') jump();
+  }});
+  document.addEventListener('keydown', function(e) {{
+    var inp = document.getElementById('pg');
+    var cur = parseInt(inp.value, 10) || 1;
+    if (e.key === '[' && cur > 1) {{ inp.value = cur - 1; jump(); }}
+    if (e.key === ']')            {{ inp.value = cur + 1; jump(); }}
+  }});
+</script>
+</body>
+</html>"""
+
+    st.components.v1.html(viewer_html, height=height, scrolling=False)
+
+
+# ─── Cached loaders ───────────────────────────────────────────────────────────
+
+@st.cache_resource
+def get_storage():
+    return StorageManager()
+
+@st.cache_resource
+def get_collections():
+    return get_storage().list_collections()
+
+@st.cache_resource
+def get_retriever(collection_name: str | None):
+    if collection_name:
+        return SmartRetriever(collection_name, verbose=False)
+    return MultiCollectionRetriever(verbose=False)
+
+
+# ─── CSS ──────────────────────────────────────────────────────────────────────
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Sora:wght@300;400;500;600&display=swap');
+
+html, body, [class*="css"] { font-family: 'Sora', sans-serif; color: #a5e1f9; }
+#MainMenu, footer, header { visibility: hidden; }
+.block-container { padding: 1.4rem 2rem 2rem 2rem !important; background-color: #00072c; }
+
+/* Main background */
+.stApp {
+    background-color: #00072c;
+}
+
+/* Sidebar styling */
+[data-testid="stSidebar"] {
+    background: #001c54 !important;
+    border-right: 1px solid #0e6ba8;
+}
+[data-testid="stSidebar"] * { color: #a5e1f9 !important; }
+[data-testid="stSidebar"] h1,
+[data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3 {
+    color: #a5e1f9 !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    letter-spacing: .05em;
+}
+
+/* Selectbox styling */
+[data-testid="stSelectbox"] {
+    background-color: #0a2471;
+    border-radius: 8px;
+    border: 1px solid #0e6ba8;
+}
+[data-testid="stSelectbox"] > div {
+    background-color: #0a2471;
+}
+[data-testid="stSelectbox"] input {
+    background-color: #0a2471;
+    color: #a5e1f9;
+}
+
+/* Button styling */
+.stButton > button {
+    background-color: #0a2471 !important;
+    color: #a5e1f9 !important;
+    border: 1px solid #0e6ba8 !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 11px !important;
+    transition: all 0.14s;
+}
+.stButton > button:hover {
+    background-color: #0e6ba8 !important;
+    color: #a5e1f9 !important;
+    border-color: #a5e1f9 !important;
+}
+
+/* Chat messages */
+[data-testid="stChatMessage"] {
+    border-radius: 10px;
+    margin-bottom: 6px;
+    background-color: #0a2471;
+    border: 1px solid #0e6ba8;
+}
+[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] {
+    color: #a5e1f9;
+}
+
+/* Chat input */
+[data-testid="stChatInput"] {
+    background-color: #0a2471;
+    border: 2px solid #0e6ba8 !important;
+    border-radius: 8px;
+}
+[data-testid="stChatInput"] input {
+    background-color: #0a2471;
+    color: #a5e1f9 !important;
+}
+[data-testid="stChatInput"] input::placeholder {
+    color: #a5e1f9 !important;
+    opacity: 0.7;
+}
+
+.source-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: #001c54; border: 1px solid #0e6ba8;
+    border-radius: 20px; padding: 4px 12px 4px 10px;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: #a5e1f9; text-decoration: none;
+    margin: 3px 4px 3px 0; cursor: pointer; transition: all .14s;
+}
+.source-pill:hover { background: #0a2471; border-color: #a5e1f9; color: #a5e1f9; }
+.source-pill .dot { width:5px; height:5px; border-radius:50%; background:#0e6ba8; flex-shrink:0; }
+
+.coll-badge {
+    display: inline-block; background: #001c54; border: 1px solid #0e6ba8;
+    color: #a5e1f9; font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    padding: 2px 8px; border-radius: 4px; letter-spacing: .06em;
+    text-transform: uppercase; margin-bottom: 6px;
+}
+
+.stat-row { display:flex; gap:8px; margin-bottom:14px; }
+.stat-card {
+    flex:1; background:#0a2471; border:1px solid #0e6ba8;
+    border-radius:8px; padding:9px 10px; text-align:center;
+}
+.stat-num  { font-family:'JetBrains Mono',monospace; font-size:19px; font-weight:600; color:#a5e1f9; line-height:1; }
+.stat-label { font-size:9px; color:#a5e1f9; letter-spacing:.06em; text-transform:uppercase; margin-top:3px; opacity:0.8; }
+
+.empty-pdf {
+    display:flex; flex-direction:column; align-items:center;
+    justify-content:center; height:460px; gap:14px;
+    color:#a5e1f9; font-family:'JetBrains Mono',monospace; font-size:12px;
+    letter-spacing:.05em; border:1px dashed #0e6ba8; border-radius:12px;
+    background: #0a2471;
+}
+.empty-pdf .ei { font-size:40px; opacity:.5; }
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+::-webkit-scrollbar-track {
+    background: #001c54;
+}
+::-webkit-scrollbar-thumb {
+    background: #a5e1f9;
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #0e6ba8;
+}
+
+/* Number input styling */
+[data-testid="stNumberInput"] input {
+    background-color: #0a2471;
+    border: 1px solid #0e6ba8;
+    color: #a5e1f9;
+}
+[data-testid="stNumberInput"] button {
+    background-color: #0a2471;
+    color: #a5e1f9;
+    border: 1px solid #0e6ba8;
+}
+[data-testid="stNumberInput"] button:hover {
+    background-color: #0e6ba8;
+    color: #a5e1f9;
+}
+
+/* Markdown text */
+[data-testid="stMarkdownContainer"] {
+    color: #a5e1f9;
+}
+
+/* Headers */
+h1, h2, h3, h4, h5, h6 {
+    color: #a5e1f9 !important;
+}
+
+/* Radio buttons and checkboxes */
+.stRadio > div {
+    color: #a5e1f9;
+}
+.stCheckbox > div {
+    color: #a5e1f9;
+}
+
+/* Tabs */
+[data-testid="stTabs"] {
+    color: #a5e1f9;
+}
+[data-testid="stTabs"] button {
+    color: #a5e1f9;
+}
+[data-testid="stTabs"] button[aria-selected="true"] {
+    background-color: #0a2471;
+    border-bottom: 2px solid #0e6ba8;
+}
+
+/* Expander */
+[data-testid="stExpander"] {
+    background-color: #0a2471;
+    border: 1px solid #0e6ba8;
+}
+[data-testid="stExpander"] summary {
+    color: #a5e1f9;
+}
+
+/* Info boxes */
+.stAlert {
+    background-color: #0a2471;
+    border: 1px solid #0e6ba8;
+    color: #a5e1f9;
+}
+
+/* Progress bar */
+.stProgress > div > div {
+    background-color: #0e6ba8;
+}
+
+/* Dataframe */
+[data-testid="stDataFrame"] {
+    color: #a5e1f9;
+}
+[data-testid="stDataFrame"] th {
+    background-color: #001c54;
+    color: #a5e1f9;
+}
+[data-testid="stDataFrame"] td {
+    background-color: #0a2471;
+    color: #a5e1f9;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─── Session state ────────────────────────────────────────────────────────────
+
+for k, v in {
+    "messages": [],
+    "selected_collection": None,
+    "pdf_filename": None,
+    "pdf_page": 1,
+    "query_count": 0,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown("## PDF·RAG")
+    st.markdown("---")
+
+    collections = get_collections()
+    if not collections:
+        st.error("No collections found.\nRun `process_pdfs.py` first.")
+        st.stop()
+
+    options = ["— All collections —"] + collections
+    idx = 0
+    if st.session_state.selected_collection in collections:
+        idx = collections.index(st.session_state.selected_collection) + 1
+
+    chosen = st.selectbox("Collection", options, index=idx)
+    selected = None if chosen == "— All collections —" else chosen
+
+    if selected != st.session_state.selected_collection:
+        st.session_state.selected_collection = selected
+        st.session_state.messages = []
+        st.session_state.pdf_filename = None
+        st.session_state.pdf_page = 1
+        st.rerun()
+
+    st.markdown("---")
+
+    total_chunks = 0
     try:
-        retriever = build_retriever(collection_name)
+        for c in collections:
+            total_chunks += get_storage().get_collection_info(c).get("count", 0)
+    except Exception:
+        pass
 
-        if isinstance(retriever, MultiCollectionRetriever):
-            response = retriever.query_best(query_text)
-        else:
-            response = retriever.query(query_text)
+    st.markdown(f"""
+    <div class="stat-row">
+      <div class="stat-card">
+        <div class="stat-num">{len(collections)}</div>
+        <div class="stat-label">Collections</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">{total_chunks}</div>
+        <div class="stat-label">Chunks</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">{st.session_state.query_count}</div>
+        <div class="stat-label">Queries</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-        if response.retrieval_successful:
-            print(response.answer)
-            # Plain source list
-            mm = MetadataManager()
-            pages  = mm.extract_pages_from_nodes(response.source_nodes)
-            ranges = mm.merge_consecutive_pages(pages)
-            fname  = mm.extract_filename_from_nodes(response.source_nodes)
+    st.markdown("---")
 
-            print(f"\nSources — {fname}")
-            for start, end in ranges:
-                print(f"  {mm.format_page_range(start, end)}: {get_viewer_url(fname, start)}")
+    if st.button("🗑  Clear chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.pdf_filename = None
+        st.session_state.pdf_page = 1
+        st.session_state.query_count = 0
+        st.rerun()
 
-            if pages:
-                open_pdf_at_page(fname, pages[0])
-            return 0
-        else:
-            print(f"Error: {response.error_message}", file=sys.stderr)
-            return 1
+    st.markdown(f"""
+    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;
+                color:#a5e1f9;margin-top:8px;">
+      ● PDF server · port {SERVER_PORT}
+    </div>""", unsafe_allow_html=True)
 
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.caption("LlamaIndex · ChromaDB · Azure OpenAI")
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# ─── Main columns ─────────────────────────────────────────────────────────────
 
-def main() -> int:
-    argc = len(sys.argv)
-    if argc == 1:
-        return interactive_query()
-    elif argc == 2:
-        return single_query(None, sys.argv[1])
-    elif argc == 3:
-        return single_query(sys.argv[1], sys.argv[2])
+col_chat, col_pdf = st.columns([1, 1], gap="large")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LEFT — Chat
+# ══════════════════════════════════════════════════════════════════════════════
+
+with col_chat:
+    st.markdown("### 💬 Ask a question")
+
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            if msg["role"] == "assistant":
+                if msg.get("collection"):
+                    st.markdown(
+                        f'<span class="coll-badge">📁 {msg["collection"]}</span>',
+                        unsafe_allow_html=True,
+                    )
+                st.markdown(msg["content"])
+
+                nodes = msg.get("nodes", [])
+                if nodes:
+                    mm     = MetadataManager()
+                    pages  = mm.extract_pages_from_nodes(nodes)
+                    ranges = mm.merge_consecutive_pages(pages)
+                    fname  = mm.extract_filename_from_nodes(nodes)
+
+                    pills = '<div style="margin-top:8px;line-height:2.4;">'
+                    for start, end in ranges:
+                        label = mm.format_page_range(start, end)
+                        url   = get_viewer_url(fname, start)
+                        pills += (
+                            f'<a class="source-pill" href="{url}" target="_blank">'
+                            f'<span class="dot"></span>{label}</a>'
+                        )
+                    pills += "</div>"
+                    st.markdown(pills, unsafe_allow_html=True)
+            else:
+                st.markdown(msg["content"])
+
+    query = st.chat_input("Ask anything about your PDFs…")
+
+    if query:
+        st.session_state.messages.append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.markdown(query)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Searching…"):
+                try:
+                    retriever  = get_retriever(st.session_state.selected_collection)
+                    is_multi   = isinstance(retriever, MultiCollectionRetriever)
+                    response   = retriever.query_best(query) if is_multi else retriever.query(query)
+                    coll_label = (response.collection_name if is_multi
+                                  else st.session_state.selected_collection)
+
+                    if response.retrieval_successful:
+                        answer = response.answer
+                        nodes  = response.source_nodes
+
+                        if coll_label:
+                            st.markdown(
+                                f'<span class="coll-badge">📁 {coll_label}</span>',
+                                unsafe_allow_html=True,
+                            )
+                        st.markdown(answer)
+
+                        mm     = MetadataManager()
+                        pages  = mm.extract_pages_from_nodes(nodes)
+                        ranges = mm.merge_consecutive_pages(pages)
+                        fname  = mm.extract_filename_from_nodes(nodes)
+
+                        if pages:
+                            pills = '<div style="margin-top:8px;line-height:2.4;">'
+                            for start, end in ranges:
+                                label = mm.format_page_range(start, end)
+                                url   = get_viewer_url(fname, start)
+                                pills += (
+                                    f'<a class="source-pill" href="{url}" target="_blank">'
+                                    f'<span class="dot"></span>{label}</a>'
+                                )
+                            pills += "</div>"
+                            st.markdown(pills, unsafe_allow_html=True)
+
+                            st.session_state.pdf_filename = fname
+                            st.session_state.pdf_page     = pages[0]
+
+                        st.session_state.messages.append({
+                            "role": "assistant", "content": answer,
+                            "nodes": nodes, "collection": coll_label,
+                        })
+                        st.session_state.query_count += 1
+
+                    else:
+                        err = response.error_message or "Unknown error"
+                        st.error(f"Retrieval failed: {err}")
+                        st.session_state.messages.append({
+                            "role": "assistant", "content": f"⚠️ {err}", "nodes": [],
+                        })
+
+                except Exception as e:
+                    logger.exception("Query error")
+                    st.error(f"Error: {e}")
+
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RIGHT — PDF Viewer (base64 data URI, no cross-origin request)
+# ══════════════════════════════════════════════════════════════════════════════
+
+with col_pdf:
+    st.markdown("### 📄 Source document")
+
+    fname = st.session_state.pdf_filename
+    page  = st.session_state.pdf_page or 1
+
+    if fname:
+        col_info, col_jump = st.columns([3, 1])
+        with col_info:
+            st.markdown(
+                f'<div style="font-family:JetBrains Mono,monospace;font-size:11px;'
+                f'color:#a5e1f9;padding-top:6px;">'
+                f'<span style="color:#0e6ba8;">●</span>&nbsp;{fname}'
+                f'&nbsp;·&nbsp;<span style="color:#a5e1f9;">page {page}</span></div>',
+                unsafe_allow_html=True,
+            )
+        with col_jump:
+            new_page = st.number_input(
+                "page", min_value=1, value=page, step=1,
+                label_visibility="collapsed", key=f"pjump_{fname}",
+            )
+            if new_page != page:
+                st.session_state.pdf_page = new_page
+                st.rerun()
+
+        # ── Inline PDF — base64 data URI, Chrome-proof ──
+        render_pdf_viewer(fname, page, height=700)
+
+        viewer_url = get_viewer_url(fname, page)
+        st.markdown(
+            f'<a href="{viewer_url}" target="_blank" '
+            f'style="font-family:JetBrains Mono,monospace;font-size:11px;'
+            f'color:#a5e1f9;text-decoration:none;border:1px solid #0e6ba8;padding:4px 12px;border-radius:4px;">↗ open in new tab</a>',
+            unsafe_allow_html=True,
+        )
     else:
-        print("Usage:")
-        print("  python query.py                           # interactive")
-        print("  python query.py 'question'                # all collections")
-        print("  python query.py collection_name 'question'")
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        st.markdown("""
+        <div class="empty-pdf">
+          <div class="ei">📄</div>
+          <div>Ask a question — the source PDF will appear here</div>
+        </div>
+        """, unsafe_allow_html=True)
