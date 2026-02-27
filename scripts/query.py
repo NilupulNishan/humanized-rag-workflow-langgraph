@@ -16,7 +16,7 @@ sys.path.insert(0, str(project_root))
 from colorama import init, Fore, Style
 
 # ── use optimized retriever ───────────────────────────────────────────────────
-from retriever_optimized import SmartRetriever, MultiCollectionRetriever
+from src.retriever import SmartRetriever, MultiCollectionRetriever
 # ─────────────────────────────────────────────────────────────────────────────
 
 from src.storage_manager import StorageManager
