@@ -36,12 +36,9 @@ st.set_page_config(
 )
 
 # ─── Start pdf_server ─────────────────────────────────────────────────────────
-
-
 @st.cache_resource
 def _boot_pdf_server():
     start_server_background()
-
 
 _boot_pdf_server()
 
@@ -300,6 +297,45 @@ loadScript(
     st_html(html, height=height, scrolling=False)
 
 
+def render_source_pills(nodes, *, key_prefix: str) -> None:
+    """
+    ✅ Pill buttons that update the RIGHT viewer inside the app.
+    (No <a href>, no new tab.)
+    """
+    if not nodes:
+        return
+
+    mm = MetadataManager()
+    pages = mm.extract_pages_from_nodes(nodes)
+    if not pages:
+        return
+
+    ranges = mm.merge_consecutive_pages(pages)
+    fname = mm.extract_filename_from_nodes(nodes)
+
+    if not fname:
+        return
+
+  
+    per_row = 6
+    for r in range(0, len(ranges), per_row):
+        row = ranges[r : r + per_row]
+        cols = st.columns(len(row))
+        for i, (start, end) in enumerate(row):
+            label = mm.format_page_range(start, end)
+            k = f"{key_prefix}_p_{start}_{end}"
+            if cols[i].button(f"• {label}", key=k, use_container_width=True):
+                if pdf_exists_on_disk(fname):
+                    st.session_state.pdf_filename = fname
+                    st.session_state.pdf_page = int(start)
+                    st.rerun()
+                else:
+                    st.warning(
+                        f"Source PDF `{fname}` not found in `{PDF_DIR}`. "
+                        f"Available: {[f.name for f in PDF_DIR.glob('*.pdf')]}"
+                    )
+
+
 # ─── Cached loaders ───────────────────────────────────────────────────────────
 @st.cache_resource
 def get_storage():
@@ -327,7 +363,8 @@ BORDER = "#cfe0ff"
 ACCENT = "#2563eb"
 CHIP = "#f1f5ff"
 
-st.markdown(f"""
+st.markdown(
+    f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Sora:wght@300;400;500;600&display=swap');
 
@@ -377,17 +414,6 @@ header[data-testid="stHeader"] {{ background:transparent !important; }}
   opacity:0.6;
 }}
 
-.source-pill {{
-  display:inline-flex; align-items:center; gap:6px;
-  background:var(--chip); border:1px solid var(--border);
-  border-radius:20px; padding:4px 12px 4px 10px;
-  font-family:'JetBrains Mono',monospace; font-size:11px;
-  color:var(--text); text-decoration:none;
-  margin:3px 4px 0 0; cursor:pointer; transition:all .14s;
-}}
-.source-pill:hover {{ background:var(--panel); border-color:var(--accent); color:var(--accent); }}
-.source-pill .dot {{ width:5px; height:5px; border-radius:50%; background:var(--accent); flex-shrink:0; }}
-
 .coll-badge {{
   display:inline-block; background:var(--chip); border:1px solid var(--border);
   color:var(--text); font-family:'JetBrains Mono',monospace; font-size:10px;
@@ -408,22 +434,18 @@ header[data-testid="stHeader"] {{ background:transparent !important; }}
 }}
 .empty-pdf .ei {{ font-size:40px; opacity:.5; }}
 
-.pills {{
-  margin-top: 10px;
-  margin-bottom: 10px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}}
-
-.source-pill,
-.source-pill:visited,
-.source-pill:hover,
-.source-pill:active {{
-  text-decoration: none !important;
-}}
+div[data-testid="stHorizontalBlock"] .stButton > button {{
+            font-size: 9px !important;
+            padding: 1px 6px !important;
+            line-height: 1.4 !important;
+            min-height: 0px !important;
+            height: auto !important;
+            border-radius: 20px !important;
+        }}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
@@ -460,13 +482,16 @@ with st.sidebar:
     except Exception:
         pass
 
-    st.markdown(f"""
+    st.markdown(
+        f"""
     <div class="stat-row">
       <div class="stat-card"><div class="stat-num">{len(collections)}</div><div class="stat-label">Collections</div></div>
       <div class="stat-card"><div class="stat-num">{total_chunks}</div><div class="stat-label">Chunks</div></div>
       <div class="stat-card"><div class="stat-num">{st.session_state.query_count}</div><div class="stat-label">Queries</div></div>
     </div>
-    """, unsafe_allow_html=True)
+    """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown("---")
 
@@ -477,11 +502,14 @@ with st.sidebar:
         st.session_state.query_count = 0
         st.rerun()
 
-    st.markdown(f"""
+    st.markdown(
+        f"""
     <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text);margin-top:8px;opacity:.85;">
       ● pdf_server · port {SERVER_PORT}
     </div>
-    """, unsafe_allow_html=True)
+    """,
+        unsafe_allow_html=True,
+    )
     st.caption("LlamaIndex · ChromaDB · Azure OpenAI")
 
 
@@ -499,7 +527,7 @@ with col_chat:
     chat_area = st.container(height=CHAT_HEIGHT)
 
     with chat_area:
-        for msg in st.session_state.messages:
+        for mi, msg in enumerate(st.session_state.messages):
             with st.chat_message(msg["role"]):
                 if msg["role"] == "assistant":
                     if msg.get("collection"):
@@ -511,19 +539,9 @@ with col_chat:
 
                     nodes = msg.get("nodes", [])
                     if nodes:
-                        mm = MetadataManager()
-                        pages = mm.extract_pages_from_nodes(nodes)
-                        ranges = mm.merge_consecutive_pages(pages)
-                        fname = mm.extract_filename_from_nodes(nodes)
+                        # ✅ pills update the right viewer inside app
+                        render_source_pills(nodes, key_prefix=f"hist_{mi}")
 
-                        pills = '<div class="pills">'
-                        for start, end in ranges:
-                            label = mm.format_page_range(start, end)
-                            url = get_viewer_url(fname, start)
-                            pills += (f'<a class="source-pill" href="{url}" target="_blank">'
-                                      f'<span class="dot"></span>{label}</a>')
-                        pills += "</div>"
-                        st.markdown(pills, unsafe_allow_html=True)
                 else:
                     st.markdown(msg["content"])
 
@@ -540,8 +558,8 @@ with col_chat:
 
             with st.chat_message("assistant"):
                 try:
-                    retriever  = get_retriever(st.session_state.selected_collection)
-                    is_multi   = isinstance(retriever, MultiCollectionRetriever)
+                    retriever = get_retriever(st.session_state.selected_collection)
+                    is_multi = isinstance(retriever, MultiCollectionRetriever)
                     coll_label = st.session_state.selected_collection
 
                     if coll_label:
@@ -550,81 +568,44 @@ with col_chat:
                             unsafe_allow_html=True,
                         )
 
-                    if is_multi:
-                        # ── Multi-collection: blocking (no streaming yet) ──────
-                        with st.spinner("Searching across collections…"):
-                            response   = retriever.query_best(query)
+                    with st.spinner("Searching…"):
+                        if is_multi:
+                            response = retriever.query_best(query)
                             coll_label = response.collection_name
-
-                        if response.retrieval_successful:
-                            st.markdown(response.answer)
-                            answer = response.answer
-                            nodes  = response.source_nodes
                         else:
-                            err = response.error_message or "Unknown error"
-                            st.error(f"Retrieval failed: {err}")
-                            st.session_state.messages.append(
-                                {"role": "assistant", "content": f"⚠️ {err}", "nodes": []}
-                            )
-                            st.rerun()
+                            response = retriever.query(query)
 
-                    else:
-                        # ── Single collection: STREAMING ──────────────────────
-                        #
-                        # retriever.stream(query)
-                        #   → embed  (0ms cached / ~900ms cold)
-                        #   → vector search + merge (~200ms) — source_nodes ready
-                        #   → LLM starts generating
-                        # st.write_stream(result)
-                        #   → renders each token live as it arrives
-                        #   → returns full answer string when done
-                        # result.source_nodes
-                        #   → already populated, zero extra API call
-                        #
-                        result = retriever.stream(query)
+                    if getattr(response, "retrieval_successful", False):
+                        answer = response.answer
+                        nodes = response.source_nodes
+                        st.markdown(answer)
 
-                        if result.failed:
-                            st.error("Retrieval failed")
-                            st.rerun()
+                        # ✅ pills update right viewer
+                        render_source_pills(nodes, key_prefix=f"live_{st.session_state.query_count}")
 
-                        # Tokens render live; full string returned when done
-                        answer = st.write_stream(result)
-                        nodes  = result.source_nodes  # instant, no round trip
-
-                    # ── Source pills (same for both paths) ────────────────────
-                    mm     = MetadataManager()
-                    pages  = mm.extract_pages_from_nodes(nodes)
-                    ranges = mm.merge_consecutive_pages(pages)
-                    fname  = mm.extract_filename_from_nodes(nodes)
-
-                    if pages and fname:
-                        pills = '<div class="pills">'
-                        for start, end in ranges:
-                            label = mm.format_page_range(start, end)
-                            url   = get_viewer_url(fname, start)
-                            pills += (f'<a class="source-pill" href="{url}" target="_blank">'
-                                      f'<span class="dot"></span>{label}</a>')
-                        pills += "</div>"
-                        st.markdown(pills, unsafe_allow_html=True)
-
-                        if pdf_exists_on_disk(fname):
+                        # auto-set viewer to first page
+                        mm = MetadataManager()
+                        pages = mm.extract_pages_from_nodes(nodes)
+                        fname = mm.extract_filename_from_nodes(nodes)
+                        if pages and fname and pdf_exists_on_disk(fname):
                             st.session_state.pdf_filename = fname
-                            st.session_state.pdf_page     = pages[0]
-                        else:
-                            st.warning(
-                                f"Source PDF `{fname}` not found in `{PDF_DIR}`. "
-                                f"Available: {[f.name for f in PDF_DIR.glob('*.pdf')]}"
-                            )
-                    elif pages and not fname:
-                        st.warning("Could not extract filename from source nodes.")
+                            st.session_state.pdf_page = int(pages[0])
 
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": answer,
-                        "nodes": nodes,
-                        "collection": coll_label,
-                    })
-                    st.session_state.query_count += 1
+                        st.session_state.messages.append(
+                            {
+                                "role": "assistant",
+                                "content": answer,
+                                "nodes": nodes,
+                                "collection": coll_label,
+                            }
+                        )
+                        st.session_state.query_count += 1
+                    else:
+                        err = getattr(response, "error_message", "Unknown error")
+                        st.error(f"Retrieval failed: {err}")
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": f"⚠️ {err}", "nodes": []}
+                        )
 
                 except Exception as e:
                     logger.exception("Query error")
@@ -643,7 +624,7 @@ with col_pdf:
     st.markdown("### 📄 Source document")
 
     fname = st.session_state.pdf_filename
-    page  = int(st.session_state.pdf_page or 1)
+    page = int(st.session_state.pdf_page or 1)
 
     if fname:
         col_info, col_jump = st.columns([3, 1])
@@ -673,7 +654,7 @@ with col_pdf:
         render_pdf_viewer_pdfjs(fname, page, height=720)
 
         viewer_url = get_viewer_url(fname, page)
-        raw_url    = get_pdf_http_url(fname, page)
+        raw_url = get_pdf_http_url(fname, page)
         st.markdown(
             f'<a href="{viewer_url}" target="_blank" style="font-family:JetBrains Mono,monospace;font-size:11px;'
             f'color:var(--text);text-decoration:none;border:1px solid var(--border);'
@@ -686,9 +667,12 @@ with col_pdf:
         )
 
     else:
-        st.markdown("""
+        st.markdown(
+            """
         <div class="empty-pdf">
           <div class="ei">📄</div>
           <div>Ask a question — the source PDF will appear here</div>
         </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
