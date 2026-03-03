@@ -67,7 +67,7 @@ def get_pdf_http_url(filename: str, page: int) -> str:
     return f"{PDF_HTTP_BASE}/{quote(filename)}#page={int(page)}"
 
 
-def render_pdf_viewer_pdfjs(filename: str, page: int, height: int = 560) -> None:
+def render_pdf_viewer_pdfjs(filename: str, page: int, height: int = 720) -> None:
     """
     Renders PDF by injecting bytes directly as a JS Uint8Array literal.
     (No fetch(), no atob(), no cross-origin dependency.)
@@ -299,7 +299,8 @@ loadScript(
 
 def render_source_pills(nodes, *, key_prefix: str) -> None:
     """
-    Pill buttons that update the PDF viewer inside the app.
+    ✅ Pill buttons that update the RIGHT viewer inside the app.
+    (No <a href>, no new tab.)
     """
     if not nodes:
         return
@@ -315,6 +316,7 @@ def render_source_pills(nodes, *, key_prefix: str) -> None:
     if not fname:
         return
 
+  
     per_row = 6
     for r in range(0, len(ranges), per_row):
         row = ranges[r : r + per_row]
@@ -373,18 +375,7 @@ st.markdown(
 
 #MainMenu, footer {{ visibility:hidden; }}
 .stApp {{ background-color:var(--bg); }}
-
-/* ── Tighter padding so chat input stays visible on laptop screens ── */
-.block-container {{
-  padding: 0.75rem 1.5rem 0.5rem 1.5rem !important;
-  background-color: var(--bg);
-  max-height: 100vh;
-  overflow: hidden;
-}}
-
-/* Reduce gap below headings */
-h3 {{ margin-top: 0 !important; margin-bottom: 0.3rem !important; }}
-
+.block-container {{ padding:1.4rem 2rem 2rem 2rem !important; background-color:var(--bg); }}
 html,body,[class*="css"] {{ font-family:'Sora',sans-serif; color:var(--text); }}
 
 [data-testid="stSidebar"] {{ background:var(--sidebar) !important; border-right:1px solid var(--border); }}
@@ -437,7 +428,7 @@ header[data-testid="stHeader"] {{ background:transparent !important; }}
 
 .empty-pdf {{
   display:flex; flex-direction:column; align-items:center; justify-content:center;
-  height:400px; gap:14px;
+  height:460px; gap:14px;
   color:var(--text); font-family:'JetBrains Mono',monospace; font-size:12px;
   letter-spacing:.05em; border:1px dashed var(--border); border-radius:12px; background:var(--panel);
 }}
@@ -450,13 +441,14 @@ div[data-testid="stHorizontalBlock"] .stButton > button {{
     min-height: 0px !important;
     height: auto !important;
     border-radius: 25px !important;
-    background-color: #f2f6ff !important;
-    color: #000000 !important;
-    border: 1px solid #5682e8 !important;
+
+    background-color: #f2f6ff !important;   
+    color: #000000 !important;               
+    border: 1px solid #5682e8!important;   
 }}
 
 div[data-testid="stHorizontalBlock"] .stButton > button:hover {{
-    background-color: #5682e8 !important;
+    background-color: #5682e8!important;   
     color: #ffffff !important;
     border-color: #5682e8 !important;
 }}
@@ -544,9 +536,7 @@ col_chat, col_pdf = st.columns([1, 1], gap="large")
 with col_chat:
     st.markdown("### Ask a question")
 
-    # 480px fits on a ~768px-tall 16:9 laptop, leaving room for
-    # the heading (~40px), chat input (~60px), and Streamlit chrome (~50px).
-    CHAT_HEIGHT = 480
+    CHAT_HEIGHT = 450
     chat_area = st.container(height=CHAT_HEIGHT)
 
     with chat_area:
@@ -562,6 +552,7 @@ with col_chat:
 
                     nodes = msg.get("nodes", [])
                     if nodes:
+                        # ✅ pills update the right viewer inside app
                         render_source_pills(nodes, key_prefix=f"hist_{mi}")
 
                 else:
@@ -602,8 +593,10 @@ with col_chat:
                         nodes = response.source_nodes
                         st.markdown(answer)
 
+                        # ✅ pills update right viewer
                         render_source_pills(nodes, key_prefix=f"live_{st.session_state.query_count}")
 
+                        # auto-set viewer to first page
                         mm = MetadataManager()
                         pages = mm.extract_pages_from_nodes(nodes)
                         fname = mm.extract_filename_from_nodes(nodes)
@@ -671,8 +664,7 @@ with col_pdf:
                 st.session_state.pdf_page = int(new_page)
                 st.rerun()
 
-        # Reduced from 720 → 560 to match chat column on laptop screens
-        render_pdf_viewer_pdfjs(fname, page, height=560)
+        render_pdf_viewer_pdfjs(fname, page, height=720)
 
         viewer_url = get_viewer_url(fname, page)
         raw_url = get_pdf_http_url(fname, page)
