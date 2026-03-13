@@ -55,6 +55,11 @@ PDF_DIRECTORY.mkdir(parents=True, exist_ok=True)
 CHROMA_DB_PATH.mkdir(parents=True, exist_ok=True)
 DOCSTORE_PATH.mkdir(parents=True, exist_ok=True)
 
+# Langgraph 
+REDIS_URL = os.getenv("REDIS_URL")
+LANGGRAPH_PERSISTENCE = os.getenv("LANGGRAPH_PERSISTENCE")
+CONFIDENCE_HIGH = os.getenv("CONFIDENCE_HIGH")
+CONFIDENCE_LOW = os.getenv("CONFIDENCE_LOW")
 
 def validate_config():
     """Validate that all required configuration is present."""
