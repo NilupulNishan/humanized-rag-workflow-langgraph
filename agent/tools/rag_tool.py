@@ -79,7 +79,7 @@ class RAGTool:
             logger.info(f"RAGTool initialised for collection: {self.collection_name}")
         return self._retriever
     
-    def retriever(self, query: str) -> RetrievalResult:
+    def retrieve(self, query: str) -> RetrievalResult:
         """
         Run retrieval against the LlamaIndex collection.
         Uses SmartRetriever.query() (non-streaming) — streaming is handled
