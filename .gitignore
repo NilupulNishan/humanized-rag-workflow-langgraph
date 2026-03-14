@@ -46,6 +46,7 @@ data/chroma_db/**
 leads_data.json
 *.zip
 *.json
+*.pdf
 
 # IDE
 .vscode/
