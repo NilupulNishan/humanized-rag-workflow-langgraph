@@ -1,4 +1,12 @@
+
 azure-core==1.35.1
+
+# for Agent workflow
+langgraph==0.3.5
+langchain==0.3.20
+langchain-core==0.3.41
+langchain-openai==0.3.5
+openai==1.90.0
 
 # PDF Processing
 pymupdf
@@ -27,24 +35,5 @@ colorama==0.4.6
 # HTTP client with connection pooling + HTTP/2(Already exist - pinned here for explicitness)
 httpx[http2]>=0.27.0
 
+Streamlit==1.55.0
 
-# for Agent workflow
-langgraph==0.3.5
-langchain==0.3.20
-langchain-core==0.3.41
-langchain-openai==0.3.5
-openai==1.90.0
-
-# ── API layer ─────────────────────────────────────────────────────────────────
-fastapi==0.115.4
-uvicorn[standard]==0.32.0
-websockets==13.1
-pydantic==2.9.2
- 
-# ── Session persistence (optional — for Redis) ────────────────────────────────
-# redis==5.2.0              # uncomment if using RedisSessionStore
- 
-# ── Dev / testing ─────────────────────────────────────────────────────────────
-pytest==8.3.3
-pytest-asyncio==0.24.0
-httpx==0.27.2               
