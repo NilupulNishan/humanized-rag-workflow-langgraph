@@ -1,0 +1,127 @@
+"""
+LangGraph Node 2: Memory Read/Write
+ 
+Input:  AgentState.session_id, AgentState.user_input, AgentState.analysis
+Output: AgentState.session (updated)
+ 
+Two responsibilities:
+  READ  — load existing session before retrieval so context enriches the query
+  WRITE — update session after response with new facts extracted from this turn
+ 
+The graph calls this node TWICE:
+  1. Before retriever_node (READ pass) — load session
+  2. After response_renderer (WRITE pass) — extract new facts, save
+ 
+A single node handles both passes via the `mode` parameter in state.
+This avoids duplicating the store access logic.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any
+
+from agent.memory.schemas import SessionData
+from agent.memory.session_store import get_session_store
+from agent.state import AgentState
+
+
+logger = logging.getLogger(__name__)
+
+def memory_read_node(state: AgentState) -> dict[str, Any]:
+    pass
+
+def memory_write_node(state: AgentState) -> dict[str, Any]:
+    pass
+
+# helpers ------------------------------------------
+def _extract_model(text: str) -> str | None:
+    """
+    Extract product model numbers from user text.
+    Heuristic patterns — extend for your specific product lines.
+    """
+    known_models = [
+        "HALO24",
+        "R3016",
+        "QUINT-PS/1AC/24DC/5",
+        "1085173",
+        "OEM",
+        "CL5708",
+        "120TV",
+        "2153449-4",
+        "32HFL3014",
+        "H3114AV",
+        "H3118AV",
+        "R740",
+        "TMP5x24",
+        "C1300-24FP-4X",
+        "S5735-L24T4S-A-V",
+        "CLEAR H98MUV3",
+        "LMXP"
+    ]
+    # Detect known models first
+    for model in known_models:
+        if re.search(rf'\b{re.escape(model)}\b', text, re.IGNORECASE):
+            return model
+        
+    # Generic patterns
+    patterns = [
+        r'\b[A-Z]{1,4}[\s\-]?[A-Z0-9]{2,8}\b',     # HP M428, X200
+        r'\bmodel\s+([A-Z0-9\-\/]+)\b',            # model X200
+        r'\b[A-Z][a-z]+[A-Z][a-z]+\s+\w+\s+\d+',   # LaserJet Pro 4104
+        r'\b[A-Z0-9]+(?:[-/][A-Z0-9]+)+\b',        # C1300-24FP-4X, QUINT-PS/1AC/24DC/5
+        r'\b[A-Z]{1,5}\d{2,6}[A-Z]*\b'             # R740, HALO24, H3114AV
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+
+    return None
+
+
+def _extract_tried_steps(text: str) -> list[str]:
+    """
+    Extract what user says they've already tried.
+
+    patterns:
+        "I already tried restarting"
+        "I restarted the printer"
+        "tried turning it off"
+        "already checked the cable"
+        "I also did restart"
+        "I've done restart", "I have done reset"
+        "I attempted restart"
+        "I gave restarting a try"
+        "I tried restarting it already"
+        NEGATIVE patterns (to capture what user DIDN'T try)
+    """
+
+    tried = []
+    patterns = [
+    r"(?:already\s+)?tried\s+([\w\s]+?)(?:\s+and|\s+but|\.|,|$)",
+    r"(?:already\s+)?(?:restarted|rebooted|reset|checked|unplugged|reconnected)\s+([\w\s]+?)(?:\.|,|$)",
+    r"(?:have\s+)?(?:already\s+)?(?:tried|done|checked)\s+([\w\s]+?)(?:\.|,|$)",
+    r"(?:already\s+)?did\s+([\w\s]+?)(?:\.|,|$)",
+    r"(?:also\s+)?did\s+([\w\s]+?)(?:\.|,|$)",
+    r"(?:have\s+|'ve\s+)?done\s+([\w\s]+?)(?:\.|,|$)",
+    r"(?:have\s+)?attempted\s+([\w\s]+?)(?:\.|,|$)",
+    r"(?:gave|give)\s+([\w\s]+?)\s+(?:a\s+)?try",
+    r"(?:already\s+)?tried\s+([\w\s]+?)\s+(?:already)?(?:\.|,|$)",
+    # NEGATIVE patterns (to capture what user DIDN'T try)
+    r"(?:did\s+not|didn't)\s+try\s+([\w\s]+?)(?:\.|,|$)",
+    r"(?:haven't|have\s+not)\s+tried\s+([\w\s]+?)(?:\.|,|$)",
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for m in matches:
+            step = m.strip()
+            if len(step) > 3:  # filter noise
+                tried.append(step)
+    return tried
+
+
+
+    
