@@ -252,17 +252,19 @@ NODE_STATUS = {
 
 # ─── Background pipeline runner ───────────────────────────────────────────────
 def run_pipeline(
-    user_input:      str,
-    session_id:      str,
-    collection_name: str | None,
-    status_q:        queue.Queue,
-    token_q:         queue.Queue,
+    user_input:           str,
+    session_id:           str,
+    collection_name:      str | None,
+    status_q:             queue.Queue,
+    token_q:              queue.Queue,
+    conversation_history: list | None = None,
 ):
     """
     Runs every LangGraph node sequentially in a background thread.
 
     status_q receives: {"node": str, "done": bool}
     token_q  receives: str (token)  |  {"DONE": True, "meta": dict}  |  {"ERROR": str}
+    conversation_history: full st.session_state.messages from previous turns
     """
     try:
         from agent.nodes.query_understanding import query_understanding_node
@@ -272,11 +274,23 @@ def run_pipeline(
         from agent.nodes.response_renderer import response_renderer_stream
         from agent.state import AgentState, AnswerPlan
 
+        # Build conversation history for LLM context.
+        # Includes previous turns so short follow-ups like "what's next"
+        # have the context they need. Capped at last 10 messages (5 turns).
+        history = conversation_history or []
+        history_for_llm = []
+        for m in history[-10:]:
+            role    = m.get("role", "user")
+            content = m.get("content", "")
+            if role in ("user", "assistant") and content:
+                history_for_llm.append({"role": role, "content": content})
+        history_for_llm.append({"role": "user", "content": user_input})
+
         state: AgentState = {
             "user_input":      user_input,
             "session_id":      session_id,
             "collection_name": collection_name or "",
-            "messages":        [{"role": "user", "content": user_input}],
+            "messages":        history_for_llm,
         }
 
         def run_node(name, fn):
@@ -533,6 +547,7 @@ with col_chat:
                         st.session_state.selected_collection,
                         status_q,
                         token_q,
+                        list(st.session_state.messages),  # full history snapshot
                     ),
                     daemon=True,
                 )
