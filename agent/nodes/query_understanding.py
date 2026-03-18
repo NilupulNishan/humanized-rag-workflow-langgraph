@@ -3,18 +3,21 @@ agent/nodes/query_understanding.py
 
 LangGraph Node 1: Query Understanding
 
-Input:  AgentState.user_input, AgentState.session
+Input:  AgentState.user_input, AgentState.session, AgentState.messages
 Output: AgentState.analysis, AgentState.effective_query
 
 What it does:
-  1. Reads user's raw message + session context
-  2. Calls LLM (cheap, fast — no retrieval yet) to classify intent
-  3. If query is short/vague: expands into 2-4 search variants
-  4. If query needs clarification: flags it (graph will route to clarify node)
-  5. Builds effective_query — the actual string(s) sent to the retriever
+  1. Reads user message + session context + conversation history
+  2. Classifies intent — including "general" for non-manual questions
+  3. If general: sets route flag → graph skips retriever entirely
+  4. If short/vague manual query: expands into search variants
+  5. If needs clarification: flags it
+  6. Builds effective_query for the retriever
 
-This node is the "human support engineer's first read" of the message.
-It decides HOW to approach answering before touching the vector DB.
+Intent routing summary:
+  "general"       → direct_answer_node  (LLM only, no manual)
+  "clarify"       → skip_retrieval_node (ask user for more info)
+  everything else → memory_read → retriever → planner → renderer
 """
 
 from __future__ import annotations
@@ -35,28 +38,24 @@ logger = logging.getLogger(__name__)
 
 
 def _get_llm() -> AzureChatOpenAI:
-    """
-    Lightweight LLM for classification — does NOT need to be the same
-    model as the retrieval synthesiser. Use a fast/cheap model here.
-    """
     from config import settings
     return AzureChatOpenAI(
         azure_deployment=settings.AZURE_GPT4O_MINI_DEPLOYMENT,
         azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
         api_key=settings.AZURE_OPENAI_API_KEY,
         api_version=settings.AZURE_OPENAI_API_VERSION,
-        temperature=0,           # deterministic classification
-        max_tokens=400,          # analysis is small
+        temperature=0,
+        max_tokens=400,
     )
 
 
 def query_understanding_node(state: AgentState) -> dict[str, Any]:
     """
     LangGraph node function.
-    Must return a dict of keys to update in AgentState.
+    Returns dict of keys to update in AgentState.
     """
     user_input = state.get("user_input", "").strip()
-    session = state.get("session", {})
+    session    = state.get("session", {})
 
     if not user_input:
         logger.warning("query_understanding: empty user_input")
@@ -73,7 +72,34 @@ def query_understanding_node(state: AgentState) -> dict[str, Any]:
             "effective_query": user_input,
         }
 
-    # Build session context string for injection into prompt
+    # ── Hard-coded social bypass — never send these to the LLM classifier ──
+    # Short social inputs are misclassified ~30% of the time by smaller models.
+    # Catch them here before any LLM call — zero latency, zero cost.
+    _SOCIAL_EXACT = {
+        "hi", "hello", "hey", "hiya", "howdy",
+        "thanks", "thank you", "thank you!", "thanks!", "thx",
+        "ok", "okay", "ok!", "okay!", "got it", "got it!",
+        "bye", "goodbye", "see you", "see ya",
+        "yes", "no", "yep", "nope", "sure", "alright",
+        "good morning", "good afternoon", "good evening",
+        "nice", "great", "awesome", "perfect", "cool",
+    }
+    if user_input.lower().rstrip(".,!? ") in _SOCIAL_EXACT:
+        logger.info(f"query_understanding: social bypass → general: '{user_input}'")
+        return {
+            "analysis": QueryAnalysis(
+                intent="general",
+                specificity="short",
+                answer_mode="direct",
+                expanded_queries=[],
+                needs_clarification=False,
+                clarification_question=None,
+                inferred_topic="social/conversational",
+            ),
+            "effective_query": "",
+        }
+
+    # ── Session context string ─────────────────────────────────────────────
     session_context = ""
     if hasattr(session, 'to_context_string'):
         session_context = session.to_context_string()
@@ -86,36 +112,27 @@ def query_understanding_node(state: AgentState) -> dict[str, Any]:
         if parts:
             session_context = "[Session: " + " | ".join(parts) + "]"
 
-    # Build prompt
+    # ── Build LLM message list with conversation history ───────────────────
+    messages_history = state.get("messages", [])
+    prior_turns = messages_history[:-1]   # exclude current user turn
+
     user_prompt = QUERY_UNDERSTANDING_USER.format(
         session_context=session_context,
         user_input=user_input,
     )
 
-    # Build message list — include conversation history so the LLM
-    # understands follow-up queries like "what's next" or "and then?"
-    messages_history = state.get("messages", [])
-    # History already has current user turn appended by app.py.
-    # Build: system + all history turns (excluding current) + analysis prompt.
-    # We replace the last user message with our enriched analysis prompt.
-    prior_turns = messages_history[:-1]  # everything except current user turn
-
     llm_messages = [{"role": "system", "content": QUERY_UNDERSTANDING_SYSTEM}]
-    # Inject prior turns as context (max 6 = 3 prior exchanges)
     for m in prior_turns[-6:]:
         if m.get("role") in ("user", "assistant") and m.get("content"):
             llm_messages.append({"role": m["role"], "content": m["content"]})
-    # Current turn: our enriched analysis prompt
     llm_messages.append({"role": "user", "content": user_prompt})
 
-    # Call LLM
+    # ── Call LLM ──────────────────────────────────────────────────────────
     try:
         llm = _get_llm()
         response = llm.invoke(llm_messages)
 
         raw = response.content.strip()
-
-        # Strip accidental markdown fences
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -134,11 +151,12 @@ def query_understanding_node(state: AgentState) -> dict[str, Any]:
             inferred_topic=data.get("inferred_topic", user_input),
         )
 
-        # Determine effective query for retriever
-        # - Short queries: use expanded set (retriever_node will handle multi-query)
-        # - Otherwise: inject session context for richer retrieval
-        if analysis["specificity"] == "short" and analysis["expanded_queries"]:
-            effective_query = user_input  # retriever_node will use expanded_queries
+        # ── Build effective_query ──────────────────────────────────────────
+        # General questions skip retrieval entirely — no effective_query needed.
+        if analysis["intent"] == "general":
+            effective_query = ""
+        elif analysis["specificity"] == "short" and analysis["expanded_queries"]:
+            effective_query = user_input
         elif session_context:
             effective_query = f"{session_context}\n{user_input}"
         else:
@@ -148,41 +166,34 @@ def query_understanding_node(state: AgentState) -> dict[str, Any]:
             f"query_understanding: intent={analysis['intent']} "
             f"mode={analysis['answer_mode']} "
             f"specificity={analysis['specificity']} "
-            f"expanded={len(analysis.get('expanded_queries', []))} variants"
+            f"general={analysis['intent'] == 'general'}"
         )
 
         return {
-            "analysis": analysis,
+            "analysis":       analysis,
             "effective_query": effective_query,
         }
 
     except json.JSONDecodeError as e:
         logger.error(f"query_understanding: JSON parse failed: {e}")
-        # Graceful degradation — treat as a direct medium-specificity query
-        return {
-            "analysis": QueryAnalysis(
-                intent="faq",
-                specificity="medium",
-                answer_mode="direct",
-                expanded_queries=[],
-                needs_clarification=False,
-                clarification_question=None,
-                inferred_topic=user_input,
-            ),
-            "effective_query": user_input,
-        }
+        return _fallback(user_input)
 
     except Exception as e:
         logger.error(f"query_understanding: LLM call failed: {e}")
-        return {
-            "analysis": QueryAnalysis(
-                intent="faq",
-                specificity="medium",
-                answer_mode="direct",
-                expanded_queries=[],
-                needs_clarification=False,
-                clarification_question=None,
-                inferred_topic=user_input,
-            ),
-            "effective_query": user_input,
-        }
+        return _fallback(user_input)
+
+
+def _fallback(user_input: str) -> dict[str, Any]:
+    """Graceful degradation — treat as plain FAQ, go through normal pipeline."""
+    return {
+        "analysis": QueryAnalysis(
+            intent="faq",
+            specificity="medium",
+            answer_mode="direct",
+            expanded_queries=[],
+            needs_clarification=False,
+            clarification_question=None,
+            inferred_topic=user_input,
+        ),
+        "effective_query": user_input,
+    }
