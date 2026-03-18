@@ -1,25 +1,28 @@
 """
+agent/nodes/query_understanding.py
+
 LangGraph Node 1: Query Understanding
- 
+
 Input:  AgentState.user_input, AgentState.session
 Output: AgentState.analysis, AgentState.effective_query
- 
+
 What it does:
   1. Reads user's raw message + session context
   2. Calls LLM (cheap, fast — no retrieval yet) to classify intent
   3. If query is short/vague: expands into 2-4 search variants
   4. If query needs clarification: flags it (graph will route to clarify node)
   5. Builds effective_query — the actual string(s) sent to the retriever
- 
+
 This node is the "human support engineer's first read" of the message.
 It decides HOW to approach answering before touching the vector DB.
 """
+
 from __future__ import annotations
- 
+
 import json
 import logging
 from typing import Any
- 
+
 from langchain_openai import AzureChatOpenAI
 
 from agent.state import AgentState, QueryAnalysis
@@ -30,7 +33,12 @@ from agent.prompts.system_prompt import (
 
 logger = logging.getLogger(__name__)
 
+
 def _get_llm() -> AzureChatOpenAI:
+    """
+    Lightweight LLM for classification — does NOT need to be the same
+    model as the retrieval synthesiser. Use a fast/cheap model here.
+    """
     from config import settings
     return AzureChatOpenAI(
         azure_deployment=settings.AZURE_GPT4O_MINI_DEPLOYMENT,
@@ -40,6 +48,7 @@ def _get_llm() -> AzureChatOpenAI:
         temperature=0,           # deterministic classification
         max_tokens=400,          # analysis is small
     )
+
 
 def query_understanding_node(state: AgentState) -> dict[str, Any]:
     """
@@ -63,7 +72,7 @@ def query_understanding_node(state: AgentState) -> dict[str, Any]:
             ),
             "effective_query": user_input,
         }
-    
+
     # Build session context string for injection into prompt
     session_context = ""
     if hasattr(session, 'to_context_string'):
@@ -83,13 +92,26 @@ def query_understanding_node(state: AgentState) -> dict[str, Any]:
         user_input=user_input,
     )
 
+    # Build message list — include conversation history so the LLM
+    # understands follow-up queries like "what's next" or "and then?"
+    messages_history = state.get("messages", [])
+    # History already has current user turn appended by app.py.
+    # Build: system + all history turns (excluding current) + analysis prompt.
+    # We replace the last user message with our enriched analysis prompt.
+    prior_turns = messages_history[:-1]  # everything except current user turn
+
+    llm_messages = [{"role": "system", "content": QUERY_UNDERSTANDING_SYSTEM}]
+    # Inject prior turns as context (max 6 = 3 prior exchanges)
+    for m in prior_turns[-6:]:
+        if m.get("role") in ("user", "assistant") and m.get("content"):
+            llm_messages.append({"role": m["role"], "content": m["content"]})
+    # Current turn: our enriched analysis prompt
+    llm_messages.append({"role": "user", "content": user_prompt})
+
     # Call LLM
     try:
         llm = _get_llm()
-        response = llm.invoke([
-            {"role": "system", "content": QUERY_UNDERSTANDING_SYSTEM},
-            {"role": "user",   "content": user_prompt},
-        ])
+        response = llm.invoke(llm_messages)
 
         raw = response.content.strip()
 
@@ -98,18 +120,18 @@ def query_understanding_node(state: AgentState) -> dict[str, Any]:
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-
         raw = raw.strip()
+
         data = json.loads(raw)
 
         analysis = QueryAnalysis(
-            intent = data.get("intent", "faq"),
-            specificity = data.get("specificity", "medium"),
-            answer_mode = data.get("answer_mode", "direct"),
-            expanded_queries = data.get("expanded_queries", []),
-            needs_clarification = data.get("needs_clarification", False),
-            clarification_question = data.get("clarification_question"),
-            inferred_topic = data.get("inferred_topic", user_input),
+            intent=data.get("intent", "faq"),
+            specificity=data.get("specificity", "medium"),
+            answer_mode=data.get("answer_mode", "direct"),
+            expanded_queries=data.get("expanded_queries", []),
+            needs_clarification=data.get("needs_clarification", False),
+            clarification_question=data.get("clarification_question"),
+            inferred_topic=data.get("inferred_topic", user_input),
         )
 
         # Determine effective query for retriever
@@ -121,7 +143,7 @@ def query_understanding_node(state: AgentState) -> dict[str, Any]:
             effective_query = f"{session_context}\n{user_input}"
         else:
             effective_query = user_input
- 
+
         logger.info(
             f"query_understanding: intent={analysis['intent']} "
             f"mode={analysis['answer_mode']} "
@@ -133,7 +155,7 @@ def query_understanding_node(state: AgentState) -> dict[str, Any]:
             "analysis": analysis,
             "effective_query": effective_query,
         }
- 
+
     except json.JSONDecodeError as e:
         logger.error(f"query_understanding: JSON parse failed: {e}")
         # Graceful degradation — treat as a direct medium-specificity query
@@ -149,7 +171,7 @@ def query_understanding_node(state: AgentState) -> dict[str, Any]:
             ),
             "effective_query": user_input,
         }
-    
+
     except Exception as e:
         logger.error(f"query_understanding: LLM call failed: {e}")
         return {
