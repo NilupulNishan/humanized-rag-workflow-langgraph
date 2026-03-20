@@ -7,7 +7,7 @@ from .chunker import DocumentChunker
 from .metadata_manager import MetadataManager
 from .storage_manager import StorageManager
 from .storage_manager import StorageManager
-from .retriever import SmartRetriever, MultiCollectionRetriever, QueryResponse
+from .retriever import RetrieverManager
 from .prompt_manager import PromptManager
 
 __all__ = [
@@ -16,9 +16,6 @@ __all__ = [
     'DocumentChunker',
     'MetadataManager',
     'StorageManager',
-    'MultiCollectionQueryEngine',
-    'SmartRetriever',
-    'MultiCollectionRetriever',
-    'QueryResponse',
+    'RetrieverManager',
     'PromptManager'
 ]
